@@ -678,7 +678,7 @@ dependencies = [
  "libm",
  "lightning-invoice",
  "lightning-macros",
- "lightning-types 0.3.0",
+ "lightning-types",
  "musig2",
  "parking_lot",
  "possiblyrandom",
@@ -727,7 +727,7 @@ dependencies = [
  "bitcoin",
  "dnssec-prover",
  "lightning",
- "lightning-types 0.3.0",
+ "lightning-types",
  "tokio",
 ]
 
@@ -738,7 +738,7 @@ dependencies = [
  "bech32",
  "bitcoin",
  "hashbrown 0.13.2",
- "lightning-types 0.3.5",
+ "lightning-types",
  "serde",
  "serde_json",
 ]
@@ -754,7 +754,7 @@ dependencies = [
  "lightning-invoice",
  "lightning-macros",
  "lightning-persister",
- "lightning-types 0.3.0",
+ "lightning-types",
  "parking_lot",
  "proptest",
  "serde",
@@ -806,15 +806,6 @@ dependencies = [
 [[package]]
 name = "lightning-types"
 version = "0.3.0"
-dependencies = [
- "bitcoin",
-]
-
-[[package]]
-name = "lightning-types"
-version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c77c676d4a34cceb2ae3756916e446b4d17f9430a24107e099981f0f9aec77e6"
 dependencies = [
  "bitcoin",
 ]
@@ -1457,7 +1448,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

@@ -12489,11 +12489,12 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	) -> Result<Bolt11Invoice, SignOrCreationError<()>> {
 		let Bolt11InvoiceParameters {
 			amount_msats, description, invoice_expiry_delta_secs, min_final_cltv_expiry_delta,
-			payment_hash,
+			payment_hash, currency,
 		} = params;
 
-		let currency =
-			Network::from_chain_hash(self.chain_hash).map(Into::into).unwrap_or(Currency::Bitcoin);
+		let currency = currency.unwrap_or_else(|| {
+			Network::from_chain_hash(self.chain_hash).map(Into::into).unwrap_or(Currency::Bitcoin)
+		});
 
 		#[cfg(feature = "std")]
 		let duration_since_epoch = {
@@ -12611,6 +12612,15 @@ pub struct Bolt11InvoiceParameters {
 	/// involving another protocol where the payment hash is also involved outside the scope of
 	/// lightning.
 	pub payment_hash: Option<PaymentHash>,
+
+	/// The currency for the invoice. If not set, the currency is derived from the
+	/// `ChannelManager`'s chain hash.
+	///
+	/// The override exists for networks whose chain hash does not uniquely identify the
+	/// network (e.g. networks that share their genesis block with another network), where
+	/// deriving the currency from the chain hash would fall back to the wrong currency. Such
+	/// networks should pass the currency matching their configured network here.
+	pub currency: Option<Currency>,
 }
 
 impl Default for Bolt11InvoiceParameters {
@@ -12621,6 +12631,7 @@ impl Default for Bolt11InvoiceParameters {
 			invoice_expiry_delta_secs: None,
 			min_final_cltv_expiry_delta: None,
 			payment_hash: None,
+			currency: None,
 		}
 	}
 }
@@ -18373,6 +18384,75 @@ mod tests {
 	use bitcoin::secp256k1::ecdh::SharedSecret;
 	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 	use core::sync::atomic::Ordering;
+
+	#[test]
+	#[rustfmt::skip]
+	fn test_bolt11_invoice_currency_override() {
+		// Nusacoin's testnet shares mainnet's genesis block, so both networks have the
+		// same chain hash and the chain-hash-based currency derivation in
+		// `create_bolt11_invoice` cannot tell them apart: it always lands on the mainnet
+		// currency. The `currency` parameter override must win when set, and the legacy
+		// derivation must be preserved exactly when it is not.
+		use bitcoin::Network;
+		use crate::ln::channelmanager::{Bolt11InvoiceParameters, ChainParameters, ChannelManager};
+		use crate::chain::BestBlock;
+		use crate::chain::chainmonitor::ChainMonitor;
+		use crate::routing::gossip::NetworkGraph;
+		use crate::sign::{KeysManager, NodeSigner};
+		use crate::util::config::UserConfig;
+		use lightning_invoice::Currency;
+		use crate::sync::{Arc, RwLock};
+
+		// Builds a manager for `network` (construction mirrors `bench_two_sends`)
+		// and returns the invoice it issues for the given currency override.
+		fn invoice_for(network: Network, seed: [u8; 32], currency: Option<Currency>) -> lightning_invoice::Bolt11Invoice {
+			let genesis_block = bitcoin::constants::genesis_block(network);
+			let tx_broadcaster = test_utils::TestBroadcaster::new(network);
+			let fee_estimator = test_utils::TestFeeEstimator::new(253);
+			let logger = test_utils::TestLogger::with_id("currency_override".to_owned());
+			let scorer = RwLock::new(test_utils::TestScorer::new());
+			let entropy = test_utils::TestKeysInterface::new(&[0u8; 32], network);
+			let router = test_utils::TestRouter::new(Arc::new(NetworkGraph::new(network, &logger)), &logger, &scorer);
+			let message_router = test_utils::TestMessageRouter::new_default(Arc::new(NetworkGraph::new(network, &logger)), &entropy);
+			let persister = test_utils::TestPersister::new();
+			let keys_manager = KeysManager::new(&seed, 42, 42, true);
+			let chain_monitor = ChainMonitor::new(None::<&test_utils::TestChainSource>, &tx_broadcaster, &logger, &fee_estimator, &persister, &keys_manager, keys_manager.get_peer_storage_key());
+			let manager = ChannelManager::new(&fee_estimator, &chain_monitor, &tx_broadcaster, &router, &message_router, &logger, &keys_manager, &keys_manager, &keys_manager, UserConfig::default(), ChainParameters {
+				network,
+				best_block: BestBlock::from_network(network),
+			}, genesis_block.header.time);
+			manager.create_bolt11_invoice(Bolt11InvoiceParameters {
+				amount_msats: Some(10_000),
+				currency,
+				..Default::default()
+			}).unwrap()
+		}
+
+		// The premise of the bug: both Nusacoin networks share one chain hash.
+		assert_eq!(
+			Network::NusacoinTestnet.chain_hash(),
+			Network::Nusacoin.chain_hash(),
+		);
+
+		// Without the override, the legacy chain-hash derivation applies and
+		// collapses to the mainnet currency even on a testnet manager.
+		let invoice = invoice_for(Network::NusacoinTestnet, [3u8; 32], None);
+		assert_eq!(invoice.currency(), Currency::Nusacoin);
+		assert!(invoice.to_string().starts_with("lnnu"));
+
+		// With the override, the invoice carries the testnet currency.
+		let invoice = invoice_for(Network::NusacoinTestnet, [3u8; 32], Some(Currency::NusacoinTestnet));
+		assert_eq!(invoice.currency(), Currency::NusacoinTestnet);
+		assert!(invoice.to_string().starts_with("lntn"));
+
+		// On a mainnet manager both settings agree on the mainnet currency.
+		let invoice = invoice_for(Network::Nusacoin, [4u8; 32], None);
+		assert_eq!(invoice.currency(), Currency::Nusacoin);
+		assert!(invoice.to_string().starts_with("lnnu"));
+		let invoice = invoice_for(Network::Nusacoin, [4u8; 32], Some(Currency::Nusacoin));
+		assert_eq!(invoice.currency(), Currency::Nusacoin);
+		assert!(invoice.to_string().starts_with("lnnu"));
+	}
 
 	#[test]
 	#[rustfmt::skip]
