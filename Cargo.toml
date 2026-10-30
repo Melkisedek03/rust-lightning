@@ -73,3 +73,8 @@ check-cfg = [
 [patch.crates-io]
 # SPIKE (Nusacoin): use the X11 rust-bitcoin fork so `Network::Nusacoin` exists.
 bitcoin = { path = "../rust-bitcoin/bitcoin" }
+# `lightning` path-depends on the in-tree `lightning-types`, while
+# `lightning-invoice` deliberately depends on the registry one; without this
+# patch the workspace graph carries both copies and the `lightning` crate
+# itself no longer compiles (invoice/payment types mismatch).
+lightning-types = { path = "lightning-types" }
