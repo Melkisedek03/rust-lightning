@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::common::{ConfirmedTx, FilterQueue, SyncState};
+use crate::common::{ConfirmedTx, FilterQueue, SyncState, MAX_SYNC_RESTARTS};
 use crate::error::{InternalError, TxSyncError};
 
 use lightning::chain::WatchedOutput;
@@ -103,6 +103,8 @@ where
 		let start_time = std::time::Instant::now();
 		let mut num_confirmed = 0;
 		let mut num_unconfirmed = 0;
+		let mut num_restarts = 0;
+		let mut sync_restarted = false;
 
 		let mut tip_hash = maybe_await!(self.client.get_tip_hash())?;
 
@@ -116,6 +118,22 @@ where
 				// Nothing to do.
 				break;
 			} else {
+				// If we arrive here again after an earlier pass of this same
+				// call, that pass asked for a restart (the tip changed
+				// mid-sync, or the server reported an inconsistency) instead
+				// of completing. Bound the number of restarts per call so a
+				// server whose answers never change cannot spin this loop
+				// forever; the caller retries on its next scheduled pass.
+				if sync_restarted {
+					num_restarts += 1;
+					if num_restarts > MAX_SYNC_RESTARTS {
+						log_error!(self.logger,
+							"Aborting transaction sync after {} restarts without completing a pass.", MAX_SYNC_RESTARTS);
+						sync_state.pending_sync = true;
+						return Err(TxSyncError::from(InternalError::Inconsistency));
+					}
+				}
+				sync_restarted = true;
 				// Update the known tip to the newest one.
 				if tip_is_new {
 					// First check for any unconfirmed transactions and act on it immediately.
@@ -298,7 +316,7 @@ where
 
 		let mut confirmed_txs: Vec<ConfirmedTx> = Vec::new();
 
-		for txid in &sync_state.watched_transactions {
+		for txid in sync_state.watched_transactions.keys() {
 			if confirmed_txs.iter().any(|ctx| ctx.txid == *txid) {
 				continue;
 			}
@@ -367,8 +385,13 @@ where
 
 			let mut matches = Vec::new();
 			let mut indexes = Vec::new();
-			let _ = merkle_block.txn.extract_matches(&mut matches, &mut indexes);
-			if indexes.len() != 1 || matches.len() != 1 || matches[0] != txid {
+			let computed_merkle_root =
+				merkle_block.txn.extract_matches(&mut matches, &mut indexes).ok();
+			if computed_merkle_root != Some(block_header.merkle_root)
+				|| indexes.len() != 1
+				|| matches.len() != 1
+				|| matches[0] != txid
+			{
 				log_error!(self.logger, "Retrieved Merkle block for txid {} doesn't match expectations. This should not happen. Please verify server integrity.", txid);
 				return Err(InternalError::Failed);
 			}
@@ -476,9 +499,12 @@ impl<L: Deref> Filter for EsploraSyncClient<L>
 where
 	L::Target: Logger,
 {
-	fn register_tx(&self, txid: &Txid, _script_pubkey: &Script) {
+	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
 		let mut locked_queue = self.queue.lock().unwrap();
-		locked_queue.transactions.insert(*txid);
+		let script_pubkeys = locked_queue.transactions.entry(*txid).or_default();
+		if script_pubkeys.iter().all(|spk| spk != script_pubkey) {
+			script_pubkeys.push(script_pubkey.to_owned());
+		}
 	}
 
 	fn register_output(&self, output: WatchedOutput) {
