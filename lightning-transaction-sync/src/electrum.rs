@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::common::{ConfirmedTx, FilterQueue, SyncState};
+use crate::common::{ConfirmedTx, FilterQueue, SyncState, MAX_SYNC_RESTARTS};
 use crate::error::{InternalError, TxSyncError};
 
 use electrum_client::utils::validate_merkle_proof;
@@ -15,7 +15,7 @@ use electrum_client::ElectrumApi;
 use lightning::chain::WatchedOutput;
 use lightning::chain::{Confirm, Filter};
 use lightning::util::logger::Logger;
-use lightning::{log_debug, log_error, log_trace};
+use lightning::{log_debug, log_error, log_trace, log_warn};
 
 use bitcoin::block::Header;
 use bitcoin::{BlockHash, Script, Transaction, Txid};
@@ -94,6 +94,8 @@ where
 		let start_time = Instant::now();
 		let mut num_confirmed = 0;
 		let mut num_unconfirmed = 0;
+		let mut num_restarts = 0;
+		let mut sync_restarted = false;
 
 		// Clear any header notifications we might have gotten to keep the queue count low.
 		while let Some(_) = self.client.block_headers_pop()? {}
@@ -112,6 +114,22 @@ where
 				// Nothing to do.
 				break;
 			} else {
+				// If we arrive here again after an earlier pass of this same
+				// call, that pass asked for a restart (the tip changed
+				// mid-sync, or the server reported an inconsistency) instead
+				// of completing. Bound the number of restarts per call so a
+				// server whose answers never change cannot spin this loop
+				// forever; the caller retries on its next scheduled pass.
+				if sync_restarted {
+					num_restarts += 1;
+					if num_restarts > MAX_SYNC_RESTARTS {
+						log_error!(self.logger,
+							"Aborting transaction sync after {} restarts without completing a pass.", MAX_SYNC_RESTARTS);
+						sync_state.pending_sync = true;
+						return Err(TxSyncError::from(InternalError::Inconsistency));
+					}
+				}
+				sync_restarted = true;
 				// Update the known tip to the newest one.
 				if tip_is_new {
 					// First check for any unconfirmed transactions and act on it immediately.
@@ -274,7 +292,7 @@ where
 		);
 		let mut watched_txs = Vec::with_capacity(sync_state.watched_transactions.len());
 
-		for txid in &sync_state.watched_transactions {
+		for (txid, watch_script_pubkeys) in &sync_state.watched_transactions {
 			match self.client.transaction_get(&txid) {
 				Ok(tx) => {
 					// Bitcoin Core's Merkle tree implementation has no way to discern between
@@ -290,10 +308,20 @@ where
 					}
 
 					watched_txs.push((txid, tx.clone()));
-					if let Some(tx_out) = tx.output.first() {
-						// We watch an arbitrary output of the transaction of interest in order to
-						// retrieve the associated script history, before narrowing down our search
-						// through `filter`ing by `txid` below.
+					// We watch an output's script_pubkey of the transaction of interest in order
+					// to retrieve the associated script history, before narrowing down our search
+					// through `filter`ing by `txid` below. Prefer a script_pubkey the transaction
+					// was registered with that actually appears in the transaction (as registered
+					// script_pubkeys may be bogus), and otherwise pick an arbitrary one, noting
+					// that electrum servers may not index OP_RETURN script_pubkeys at all.
+					let candidate_outputs =
+						tx.output.iter().filter(|output| !output.script_pubkey.is_op_return());
+					let watch_output = candidate_outputs
+						.clone()
+						.find(|output| watch_script_pubkeys.contains(&output.script_pubkey))
+						.or_else(|| candidate_outputs.clone().next())
+						.or_else(|| tx.output.iter().next());
+					if let Some(tx_out) = watch_output {
 						watched_script_pubkeys.push(tx_out.script_pubkey.clone());
 					} else {
 						debug_assert!(false, "Failed due to retrieving invalid tx data.");
@@ -335,11 +363,23 @@ where
 					let mut filtered_history =
 						script_history.iter().filter(|h| h.tx_hash == **txid);
 					if let Some(history) = filtered_history.next() {
+						if history.height <= 0 {
+							// Skip if it's a an unconfirmed entry.
+							continue;
+						}
 						let prob_conf_height = history.height as u32;
-						let confirmed_tx = self.get_confirmed_tx(tx, prob_conf_height)?;
-						confirmed_txs.push(confirmed_tx);
+						if let Some(confirmed_tx) = self.get_confirmed_tx(tx, prob_conf_height)? {
+							confirmed_txs.push(confirmed_tx);
+						}
 					}
-					debug_assert!(filtered_history.next().is_none());
+					if filtered_history.next().is_some() {
+						log_error!(
+							self.logger,
+							"Failed due to server returning multiple history entries for Tx {}.",
+							txid
+						);
+						return Err(InternalError::Failed);
+					}
 				}
 
 				for (watched_output, script_history) in
@@ -347,6 +387,7 @@ where
 				{
 					for possible_output_spend in script_history {
 						if possible_output_spend.height <= 0 {
+							// Skip if it's a an unconfirmed entry.
 							continue;
 						}
 
@@ -372,17 +413,25 @@ where
 								}
 
 								let prob_conf_height = possible_output_spend.height as u32;
-								let confirmed_tx = self.get_confirmed_tx(&tx, prob_conf_height)?;
-								confirmed_txs.push(confirmed_tx);
+								if let Some(confirmed_tx) =
+									self.get_confirmed_tx(&tx, prob_conf_height)?
+								{
+									confirmed_txs.push(confirmed_tx);
+								}
 							},
 							Err(e) => {
-								log_trace!(
+								// The server lists this transaction in the
+								// script's history but cannot produce it. Skip
+								// the candidate for this pass instead of
+								// aborting the whole sync; a later pass
+								// against a consistent server state can still
+								// pick it up.
+								log_warn!(
 									self.logger,
-									"Inconsistency: Tx {} was unconfirmed during syncing: {}",
+									"Skipping possible output spend {} for this sync pass as it could not be retrieved: {}",
 									txid,
 									e
 								);
-								return Err(InternalError::Inconsistency);
 							},
 						}
 					}
@@ -436,9 +485,20 @@ where
 		Ok(unconfirmed_txs)
 	}
 
+	/// Checks whether the given transaction is confirmed at the given height
+	/// by asking the server for a merkle proof and validating it.
+	///
+	/// Returns `Ok(None)` when the server claims the transaction is confirmed
+	/// at that height but cannot prove it (no proof could be retrieved, or the
+	/// proof does not validate). Such an unprovable claim is not treated as a
+	/// fatal inconsistency: the transaction is simply considered unconfirmed
+	/// for this pass, and a later pass against a consistent server state can
+	/// still confirm it. Only a proof that *does* validate marks a transaction
+	/// confirmed, so this cannot confirm anything that is not actually in the
+	/// claimed block.
 	fn get_confirmed_tx(
 		&self, tx: &Transaction, prob_conf_height: u32,
-	) -> Result<ConfirmedTx, InternalError> {
+	) -> Result<Option<ConfirmedTx>, InternalError> {
 		let txid = tx.compute_txid();
 		match self.client.transaction_get_merkle(&txid, prob_conf_height as usize) {
 			Ok(merkle_res) => {
@@ -447,12 +507,13 @@ where
 					Ok(block_header) => {
 						let pos = merkle_res.pos;
 						if !validate_merkle_proof(&txid, &block_header.merkle_root, &merkle_res) {
-							log_trace!(
+							log_warn!(
 								self.logger,
-								"Inconsistency: Block {} was unconfirmed during syncing.",
+								"Tx {} is claimed to be confirmed in block {} but its merkle proof is invalid; treating it as unconfirmed for this sync pass.",
+								txid,
 								block_header.block_hash()
 							);
-							return Err(InternalError::Inconsistency);
+							return Ok(None);
 						}
 						let confirmed_tx = ConfirmedTx {
 							tx: tx.clone(),
@@ -461,7 +522,7 @@ where
 							block_height: prob_conf_height,
 							pos,
 						};
-						Ok(confirmed_tx)
+						Ok(Some(confirmed_tx))
 					},
 					Err(e) => {
 						log_error!(
@@ -475,13 +536,14 @@ where
 				}
 			},
 			Err(e) => {
-				log_trace!(
+				log_warn!(
 					self.logger,
-					"Inconsistency: Tx {} was unconfirmed during syncing: {}",
+					"Tx {} is claimed to be confirmed at height {} but its merkle proof could not be retrieved ({}); treating it as unconfirmed for this sync pass.",
 					txid,
+					prob_conf_height,
 					e
 				);
-				Err(InternalError::Inconsistency)
+				Ok(None)
 			},
 		}
 	}
@@ -498,9 +560,12 @@ impl<L: Deref> Filter for ElectrumSyncClient<L>
 where
 	L::Target: Logger,
 {
-	fn register_tx(&self, txid: &Txid, _script_pubkey: &Script) {
+	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
 		let mut locked_queue = self.queue.lock().unwrap();
-		locked_queue.transactions.insert(*txid);
+		let script_pubkeys = locked_queue.transactions.entry(*txid).or_default();
+		if script_pubkeys.iter().all(|spk| spk != script_pubkey) {
+			script_pubkeys.push(script_pubkey.to_owned());
+		}
 	}
 
 	fn register_output(&self, output: WatchedOutput) {
